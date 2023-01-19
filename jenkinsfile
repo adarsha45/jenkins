@@ -2,6 +2,7 @@
 def BUILD_NUMBER=env.BUILD_NUMBER
 def instanceUrl = 'https://login.salesforce.com'
 def CURRENT_USERNAME = currentBuild.getBuildCauses()[0].userId
+
 currentBuild.description = "Created By: ${params.devHubUsername} \n SQX Branch: ${params.sqxBranchName} \n UI Branch: ${params.uiBranchName}"
 
 //Running Parallel Stage As a Function  to create 10-N 
@@ -18,6 +19,7 @@ def createScratchOrg(ORG_ALIAS) {
             writeFile file: "$JENKINS_HOME/scratch-org-credentials/${ORG_ALIAS}", text: "${ORG_ALIAS}\n$username\n$password"
             sh "sfdx force:user:permset:assign -n CQ_System_Administrator -u ${ORG_ALIAS}";
     }
+
      // Deploy main package to corresponding org
     stage("Deploy Main Package to  Org ${ORG_ALIAS}"){
             echo "Deploying Main Pacakge"
@@ -139,6 +141,8 @@ node{
         mimeType: 'text/html',
         from: CURRENT_USERNAME,
         subject: "Your scratch org creation is Successfull",
-        body: currentBuild.description       
+        body: currentBuild.description
+    
+        
     }
 }

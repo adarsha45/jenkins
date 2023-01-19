@@ -1,0 +1,21 @@
+pipeline {
+  parameters {
+    string(name: 'DEPLOY_TYPE', defaultValue: 'unmanaged', description: 'Type of deployment')
+  }
+  stages {
+    stage('Prompt for additional parameters') {
+      when {
+        expression { params.DEPLOY_TYPE == 'unmanaged' }
+      }
+      steps {
+        input {
+          message 'Please specify the additional parameters:'
+          parameters {
+            string(name: 'TARGET_ENVIRONMENT', description: 'Target environment for the deployment')
+            string(name: 'DEPLOYMENT_TOOL', description: 'Deployment tool to use')
+          }
+        }
+      }
+    }
+  }
+}

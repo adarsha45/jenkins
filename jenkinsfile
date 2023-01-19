@@ -1,0 +1,148 @@
+#!/usr/bin/env groovy
+def BUILD_NUMBER=env.BUILD_NUMBER
+def instanceUrl = 'https://login.salesforce.com'
+def CURRENT_USERNAME = currentBuild.getBuildCauses()[0].userId
+
+currentBuild.description = "Created By: ${params.devHubUsername} \n SQX Branch: ${params.sqxBranchName} \n UI Branch: ${params.uiBranchName}"
+
+//Running Parallel Stage As a Function  to create 10-N 
+def createScratchOrg(ORG_ALIAS) {
+    //create N no of scratch orgs
+    stage('Create Scratch Org'){
+            sh "sfdx force:org:create -a ${ORG_ALIAS} -f test/config/project-scratch-def.json -d 1 -v adarshashrestha957@wise-otter-uzvs4t.com"
+            sh "sfdx force:user:password:generate -u ${ORG_ALIAS} "
+            def datas = sh(script: "sfdx force:user:display -u ${ORG_ALIAS} --json", returnStdout: true)
+            def resultpass = readJSON text: datas
+            def password = resultpass.result.password
+            def username = resultpass.result.username
+             //Store the credentials to $JENKINS_HOME
+            writeFile file: "$JENKINS_HOME/scratch-org-credentials/${ORG_ALIAS}", text: "${ORG_ALIAS}\n$username\n$password"
+            sh "sfdx force:user:permset:assign -n CQ_System_Administrator -u ${ORG_ALIAS}";
+    }
+
+     // Deploy main package to corresponding org
+    stage("Deploy Main Package to  Org ${ORG_ALIAS}"){
+            echo "Deploying Main Pacakge"
+            sh "sfdx force:source:deploy -u ${ORG_ALIAS} -w 200 -p build/antscripts/bin/src"
+    }
+    
+     // Deploy External Source to corresponding org
+    stage("Deploy ExternalSrc to ORG ${ORG_ALIAS}"){
+        echo "Deploying External Source"
+        sh "sfdx force:mdapi:deploy -d build/antscripts/bin/extPkg/src -u ${ORG_ALIAS} -w 200"
+    }
+     // Deploy External Source to corresponding org
+    stage("Deploy ExternalSrc to ORG ${ORG_ALIAS}"){
+        echo "Deploying External Source"
+        sh "sfdx force:mdapi:deploy -d build/antscripts/bin/extPkg/src -u ${ORG_ALIAS} -w 200"
+    }
+    
+     // Deploy CQUI Package to corresponding org
+   stage("Deploy UI Packages to ORG ${ORG_ALIAS}"){
+        echo "Deploying force-app..."
+        sh "sfdx force:source:deploy -p build/antscripts/bin/extensions/cq-form/force-app -u ${ORG_ALIAS} -w 200"
+            
+        echo "Deploying dependent..."
+        sh "sfdx force:source:deploy -p build/antscripts/bin/extensions/cq-form/dependent -u ${ORG_ALIAS} -w 200"
+            
+        echo "Deploying externalPackage..."
+        sh "sfdx force:mdapi:deploy -d build/antscripts/bin/extensions/cq-form/externalPackage -u ${ORG_ALIAS} -w 200"
+    }
+ 
+        // Run Apex Script as post deployment Actions
+    stage("Execute Post Deployment Actions in ${ORG_ALIAS}"){ 
+        echo "Running Apex"
+        sh "sfdx force:apex:execute -u ${ORG_ALIAS} -f scripts/apex/Create_CustomSetting_CQSetting_Record.apex" 
+        sh "sfdx force:apex:execute -u ${ORG_ALIAS} -f scripts/apex/LibraryAssignment.apex" 
+        sh "sfdx force:apex:execute -u ${ORG_ALIAS} -f scripts/apex/StartSchedulerJobs.apex" 
+    }
+}
+//start of pipeline
+node{
+    properties([
+        parameters([
+            string(name:'sqxBranchName',defaultValue:'development/13.0.0', description:'Enter the commit hash or branch number'),
+            string(name:'numberOfOrgs',defaultValue:'1', description:'Number of orgs to create'),
+            string(name:'uiBranchName',defaultValue:'13.0.0', description:'Specify cqForm branch name if sqx is less than 13.'),
+            string(name:'durationOfOrg',defaultValue:'21', description:'Enter duration for org creation in days'),
+            string(name:'devHubUsername',defaultValue:'example@devhub.cq.com', description:'Enter Devhub username which will be used to create the scratch org')
+        ])
+    ])
+    
+    checkout([
+        $class: 'GitSCM', 
+        branches: [[name: sqxBranchName]], 
+        extensions: [
+            [
+                $class: 'SubmoduleOption',
+                disableSubmodules: false,
+                parentCredentials: true,
+                recursiveSubmodules: true,
+                trackingSubmodules: true
+            ]
+            ,[
+                $class: 'WipeWorkspace'
+            ]
+        ],
+        userRemoteConfigs: [[credentialsId : 'BitbucketJenkinsCredential', url: 'https://bitbucket.org/ambarkaar/sqx.git']]])
+        
+    stage("Checkout UI Branch ${uiBranchName}"){
+        //clone ui branch if sqx branch is less than 13...
+        if(!checkBranch){
+            dir("extensions/cq-form"){
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', 
+                        credentialsId: 'BitbucketJenkinsCredential', 
+                        usernameVariable: 'GIT_USERNAME', 
+                        passwordVariable: 'GIT_PASSWORD']]) { 
+                    sh 'git fetch https://${GIT_USERNAME}:${GIT_PASSWORD}@bitbucket.org/ambarkaar/cq-form.git'
+                    sh "git checkout origin/${uiBranchName}"
+                }
+                echo "Successfully Checked out cq-form branch: ${uiBranchName}"
+            }
+        }
+    }    
+    
+    stage('Build CQ'){
+        dir('build/antscripts'){
+                sh "ant -f project.build.xml -Ddep.sf.username=username@dev.cq.com -DdeployToSF=false initiateBuild"
+                sh "rm bin/src/package.xml"
+        }           
+    }
+    
+    withCredentials([file(credentialsId: 'SERVER_KEY', variable:'jwt_key_file'), string(credentialsId: 'CLIENT_ID', variable:'cq_consumer_secret')])
+    {
+        // Authorize the Dev Hub org with JWT key and give it an alias.
+        stage('Authorize DevHub') { 
+             //Logout from the org 
+            sh "sfdx auth:jwt:grant --instanceurl ${instanceUrl} --clientid ${cq_consumer_secret} --username ${devHubUsername} --jwtkeyfile ${jwt_key_file}";
+        }
+        stage('Concurrent operation to create 10-n no of scratch org'){
+            if(fileExists("${JENKINS_HOME}/scratch-org-credentials")) {
+                def fileList = sh(script: "ls $JENKINS_HOME/scratch-org-credentials | wc -l", returnStdout: true).trim()
+                int numScratchOrgs = fileList as int
+                    //Create a total of 10 number of scratch org
+                remainingScratchOrgs = 10 - numScratchOrgs
+                echo "Number of scratch orgs already created: ${numScratchOrgs}"
+                echo "Number of remaining scratch orgs: ${remainingScratchOrgs}"
+                def orgCreations = []
+                for (int i = 0; i < remainingScratchOrgs ; i++) {
+                    def vmNumber = i 
+                    println i
+                    def ORG_ALIAS = 'CQDevOrg'+String.valueOf(vmNumber)+String.valueOf(BUILD_NUMBER);
+                    orgCreations.add(createScratchOrg(ORG_ALIAS))
+            }
+                parallel ('orgCreations': {orgCreations}, failFast: true )         
+            }
+        }
+    }
+    if(currentBuild.currentResult == "SUCCESS"){
+        echo "Sending mail to the User"
+        mail to: CURRENT_USERNAME,
+        mimeType: 'text/html',
+        from: CURRENT_USERNAME,
+        subject: "Your scratch org creation is Successfull",
+        body: currentBuild.description
+    
+        
+    }
+}

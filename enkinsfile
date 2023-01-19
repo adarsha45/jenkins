@@ -1,0 +1,128 @@
+BUILD_NUMBER=env.BUILD_NUMBER
+DEPLOY_TYPE = "${params['DEPLOY TYPE']}" == "Managed"
+IS_RELEASE = "${params['Release Type:']}" == "Managed - Released"
+PACKAGE_NAME = "CQ Config UI Extension"
+PACKAGE_PATH = "unlocked"
+SERVICE_PACKAGE_NAME = "CQ UI Extension"
+SERVICE_PATH = "dependent-managed"
+VERIFICATION_ORG_ALIAS = "CQUIVerificationOrgUnlocked"
+DEFAULT_DEVHUB_USER = env.DEFAULT_DEVHUB_USER
+
+node()
+{
+    checkout scm;
+    withCredentials([file(credentialsId: 'SERVER_KEY', variable:'jwt_key_file'), string(credentialsId: 'CLIENT_ID', variable:'cq_consumer_secret')])
+    {   
+        stage('Authorize devhub'){
+            //check if devhub is already authorized and connected
+            try {
+                sh "sfdx force:auth:logout --targetusername ${DEFAULT_DEVHUB_USER} --noprompt"
+            } catch (Exception e) {
+                //continue if no org exists to logout
+            }
+            sh 'sfdx auth:jwt:grant --instanceurl ${INSTANCE_URL} --clientid ${cq_consumer_secret} --username ${DEFAULT_DEVHUB_USER} --jwtkeyfile ${jwt_key_file} --setdefaultdevhubusername'
+        }
+    }
+    for (int i = 0; i < params.numberOfOrgs.toInteger(); i++) {
+        //alias the loop variable to refer it in the closure
+            def vmNumber = i 
+            def ORG_ALIAS = 'CQDevOrg'+String.valueOf(vmNumber)+String.valueOf(BUILD_NUMBER);
+            
+        stage("Verify Org Limit"){
+            if(params.numberOfOrgs.toInteger() > 10){
+                error "Org Creation Failed. Seems like you tried to create more than 5 orgs..."
+                continuePipeline = false
+            }
+        }
+        //check if the deploy type is :Managed or :UnManaged
+        if(DEPLOY_TYPE == 'Managed'){
+            stage('Setup Verification Org'){
+            // Identify CQ dependency version id
+                def props = readJSON file: 'sfdx-project.json'
+                def cquiPackage = props.packageDirectories.find {element -> element.package == PACKAGE_NAME}
+                def dependencyName = cquiPackage.dependencies[0].package
+                def dependencyId = props.packageAliases[dependencyName]
+
+                // Create scratch org 
+                sh "sfdx force:org:create -f config/project-scratch-def.json -v ${DEFAULT_DEVHUB_USER} -a ${ORG_ALIAS} -d 3 -n"
+                sh "sfdx force:user:password:generate -u ${ORG_ALIAS}"
+                def datas = sh(script: "sfdx force:user:display -u ${ORG_ALIAS} --json", returnStdout: true)
+                def result = readJSON text: datas
+                def username = result.result.username
+                def password = result.result.password
+
+                // --------------  install the dependency ---------------------
+                cquiPackage.dependencies.each{ key, value ->
+                    dependencyName = "${key.package}"
+                    dependencyId = props.packageAliases[dependencyName]
+                    sh "sfdx force:package:install -p ${dependencyId} -r -u ${ORG_ALIAS} -s AdminsOnly -w 200"
+                    }
+                }
+
+                //-------------storing credentials in credentials.txt -------------------
+                    sh "mkdir -p scratch-org-credentials/managed/${ORG_ALIAS}"
+                    sh "echo 'Username: ${username}\nPassword: ${password}' > scratch-org-credentials/managed/${ORG_ALIAS}/credentials.txt"     
+
+        }else{
+                //-------------------if the deploy type is :unmanaged------------------------
+        stage('Verify UIBranchname, sqxBranchname and devhubusername as param'){
+                properties([
+                    parameters([
+                        string(name:'sqxBranchName',defaultValue:'DOPS-131', description:'Enter the commit hash or branch number'),
+                        string(name:'uiBranchName',defaultValue:'12.0.0', description:'Specify cqForm branch to deploy'),
+                        // string(name:'devHubUsername',defaultValue:'example@devhub.cq.com', description:'Enter Devhub username which will be used to create the scratch org')
+                    ])
+                ])
+            }
+
+            stage('set up verification org'){
+                sh "sfdx force:org:create -f config/project-scratch-def.json -v ${DEFAULT_DEVHUB_USER} -a ${ORG_ALIAS} -d 3 -n"
+                sh "sfdx force:user:password:generate -u ${ORG_ALIAS}"
+                def datas = sh(script: "sfdx force:user:display -u ${ORG_ALIAS} --json", returnStdout: true)
+                def result = readJSON text: datas
+                def username = result.result.username
+                def password = result.result.password
+
+                //------------- storing credentials in credentials.txt -------------------
+                sh "mkdir -p scratch-org-credentials/unmanaged/${ORG_ALIAS}"
+                sh "echo 'Username: ${username}\nPassword: ${password}' > scratch-org-credentials/unmanaged/${ORG_ALIAS}/credentials.txt"     
+            }
+
+            stage('Build the Source Code'){
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', 
+                        credentialsId: 'BitbucketJenkinsCredential', 
+                        usernameVariable: 'GIT_USERNAME', 
+                        passwordVariable: 'GIT_PASSWORD']]) {
+                sh "rm -rf cq-form"
+                sh 'git clone -b ${uiBranchName} https://${GIT_USERNAME}:${GIT_PASSWORD}@bitbucket.org/ambarkaar/cq-form.git'
+                // sh "git merge origin/${releaseBranch}" 
+
+                sh "rm -rf build"
+                sh 'git clone -b ${sqxBranchName} https://${GIT_USERNAME}:${GIT_PASSWORD}@bitbucket.org/ambarkaar/sqx-ci.git build';
+                dir ('build/antscripts') {
+                    sh 'ant -f project.build.xml -D"dep.sf.username=example@dev.cq.com" -D"outputUIExtensionDirectory=bin/cq-ui" -D"extensionCqUiDir=../../cq-form" -D"ehsUnmanaged=true" -D"destNamespacePrefixOnly=cqwhs" -D"destNamespacePrefix=cqwhs__" buildUIUnmanagedPackage';
+                    
+            // Merge dependent into force-app
+                    sh """
+                    cat > CustomLabels.labels-meta.xml << EOF
+                    `egrep -v '<\\/CustomLabels>' bin/cq-ui/force-app/main/default/labels/CustomLabels.labels-meta.xml`
+                    `sed -n "/<labels>/,/<\\/labels>/p" bin/cq-ui/dependent/main/default/labels/CustomLabels.labels-meta.xml`
+                    `echo '</CustomLabels>'`
+                    `mv CustomLabels.labels-meta.xml bin/cq-ui/dependent/main/default/labels/CustomLabels.labels-meta.xml`
+                    EOF
+                    """.stripIndent();
+                    sh "cp -a bin/cq-ui/dependent/. bin/cq-ui/force-app/";
+                }
+            }  
+        }
+            stage ('Build ehs package'){
+                dir ('build/antscripts') {
+                    sh 'ant -f project.build.xml -D"dep.sf.username=example@dev.cq.com" -D"outputUIExtensionDirectory=bin/cq-ehs" -D"extensionCqUiDir=../../" -D"extensionPackageDirectory=force-app" -D"ehsUnmanaged=true" -D"destNamespacePrefixOnly=cqwhs" -D"destNamespacePrefix=cqwhs__"  buildUnmanagedExtensionPackage';                    
+        }
+    } 
+            stage ('Deploy CQUI Package'){
+                sh "sfdx force:source:deploy -u ${ORG_ALIAS} -p './build/antscripts/bin/cq-ui/force-app' -w 200"        
+            }
+        }
+    }
+}

@@ -1,0 +1,164 @@
+BUILD_NUMBER=env.BUILD_NUMBER
+DEPLOY_TYPE = "${params['DEPLOY TYPE']}" == "Managed"
+IS_RELEASE = "${params['Release Type:']}" == "Managed - Released"
+PACKAGE_NAME = "CQ Config UI Extension"
+PACKAGE_PATH = "unlocked"
+SERVICE_PACKAGE_NAME = "CQ UI Extension"
+SERVICE_PATH = "dependent-managed"
+VERIFICATION_ORG_ALIAS = "CQUIVerificationOrgUnlocked"
+DEFAULT_DEVHUB_USER = env.DEFAULT_DEVHUB_USER
+
+node()
+{
+    properties([
+        parameters([
+            string(name:'sqxBranchName',defaultValue:'development/12.0.0', description:'Enter the commit hash or branch number'),
+            string(name:'numberOfOrgs',defaultValue:'1', description:'Number of orgs to create'),
+            string(name:'uiBranchName',defaultValue:'12.0.0', description:'Specify cqForm branch to deploy'),
+            string(name:'durationOfOrg',defaultValue:'21', description:'Enter duration for org creation in days'),
+            string(name:'devHubUsername',defaultValue:'example@devhub.cq.com', description:'Enter Devhub username which will be used to create the scratch org')
+        ])
+    ])
+
+    withCredentials([file(credentialsId: 'SERVER_KEY', variable:'jwt_key_file'), string(credentialsId: 'CLIENT_ID', variable:'cq_consumer_secret')])
+    {   
+        stage('Authorize devhub'){
+            //check if devhub is already authorized and connected
+            try {
+                sh "sfdx force:auth:logout --targetusername ${DEFAULT_DEVHUB_USER} --noprompt"
+            } catch (Exception e) {
+                //continue if no org exists to logout
+            }
+            sh 'sfdx auth:jwt:grant --instanceurl ${INSTANCE_URL} --clientid ${cq_consumer_secret} --username ${DEFAULT_DEVHUB_USER} --jwtkeyfile ${jwt_key_file} --setdefaultdevhubusername'
+        }
+    }
+    for (int i = 0; i < params.numberOfOrgs.toInteger(); i++) {
+            def vmNumber = i //alias the loop variable to refer it in the closure
+            def ORG_ALIAS = 'CQDevOrg'+String.valueOf(vmNumber)+String.valueOf(BUILD_NUMBER);
+            
+        stage("Verify Org Limit"){
+            if(params.numberOfOrgs.toInteger() > 10){
+                error "Org Creation Failed. Seems like you tried to create more than 5 orgs..."
+                continuePipeline = false
+            }
+        }
+
+        // stage("Creating Org ${ORG_ALIAS}") {
+        //     try {
+        //          sh "sfdx force:org:delete -u ${ORG_ALIAS} -p"
+        //             } catch (Exception e) {
+        //                 //continue if no scratch org exists
+        //         }
+        //     sh "sfdx force:org:create -f config/project-scratch-def.json -a ${ORG_ALIAS} -d ${params.durationOfOrg} -v ${devHubUsername}"
+        // }
+
+        // stage("Generate User Password ${ORG_ALIAS}"){
+        //     echo "Generating Password"
+        //     sh "sfdx force:user:password:generate -u ${ORG_ALIAS} -v ${devHubUsername} --json"
+        //     def datas = sh(script: "sfdx force:user:display -u ${ORG_ALIAS} --json", returnStdout: true)
+        //     def result = readJSON text: datas
+        //     def username = result.result.username
+        //     def password = result.result.password
+        //     //storing credentials in credentials.txt 
+
+        //     sh "mkdir -p scratch-org-credentials/${ORG_ALIAS}"
+        //     sh "echo 'Username: ${username}\nPassword: ${password}' > scratch-org-credentials/${ORG_ALIAS}/credentials.txt"        
+        // }
+
+        if(DEPLOY_TYPE == 'Managed'){
+            checkout scm;
+        //     stage("Cloning SQX-CI branch"){
+        //         withCredentials([[$class: 'UsernamePasswordMultiBinding', 
+        //                 credentialsId: 'BitbucketJenkinsCredential', 
+        //                 usernameVariable: 'GIT_USERNAME', 
+        //                 passwordVariable: 'GIT_PASSWORD']]) { 
+        //         sh 'git clone -b ${sqxBranchName} https://${GIT_USERNAME}:${GIT_PASSWORD}@bitbucket.org/ambarkaar/sqx-ci.git build'
+        //     }
+        // }
+            stage('Setup Verification Org'){
+            // Identify CQ dependency version id
+                def props = readJSON file: 'sfdx-project.json'
+                def cquiPackage = props.packageDirectories.find {element -> element.package == PACKAGE_NAME}
+                def dependencyName = cquiPackage.dependencies[0].package
+                def dependencyId = props.packageAliases[dependencyName]
+
+                def dependencyAlreadyInstalled = checkIfPackageExistIn(ORG_ALIAS, dependencyId)
+
+                if(!dependencyAlreadyInstalled){
+                    // delete existing scratch org and create new org
+                    try {
+                        sh "sfdx force:org:delete -u ${ORG_ALIAS} -p"
+                    } catch (Exception e) {
+                        //continue if no scratch org exists
+                    }
+                    // Create scratch org and install the dependency
+                    sh "sfdx force:org:create -f config/project-scratch-def.json -v ${DEFAULT_DEVHUB_USER} -a ${VERIFICATION_ORG_ALIAS} -d 3 -n"
+                    sh "sfdx force:user:password:generate -u ${VERIFICATION_ORG_ALIAS}"
+                    def datas = sh(script: "sfdx force:user:display -u ${ORG_ALIAS} --json", returnStdout: true)
+                    def result = readJSON text: datas
+                    def username = result.result.username
+                    def password = result.result.password
+                    //storing credentials in credentials.txt 
+                    sh "mkdir -p scratch-org-credentials/${ORG_ALIAS}"
+                    sh "echo 'Username: ${username}\nPassword: ${password}' > scratch-org-credentials/${ORG_ALIAS}/credentials.txt"        
+                    cquiPackage.dependencies.each{ key, value ->
+                        dependencyName = "${key.package}"
+                        dependencyId = props.packageAliases[dependencyName]
+                        sh "sfdx force:package:install -p ${dependencyId} -r -u ${ORG_ALIAS} -s AdminsOnly -w 200"
+                    }
+                }
+    
+            // Outputting the login url, this can be helpful while debugging the build failure issue
+                sh "sfdx force:org:open -u ${ORG_ALIAS} -r"
+            }
+            stage('Verify CQUI Packages'){
+                // Validate ui packages
+                sh "sfdx force:source:deploy -p ${PACKAGE_PATH} -w 100 -u ${ORG_ALIAS} --verbose"
+            }
+
+            stage('Create CQ UI Unlocked Package Version'){
+                echo "CQ UI Package version creation request in progress..."
+                createPackageVersionFor(PACKAGE_NAME, PACKAGE_PATH, IS_RELEASE)
+            }   
+        }
+    }
+}
+def checkIfPackageExistIn(def orgAlias, def packageVersionId) {
+    def hasPackage = false;
+    try{
+        def rawPackageList = sh returnStdout: true, script: "sfdx force:package:installed:list -u '${orgAlias}' --json"
+        def packageList = readJSON text: rawPackageList
+        if(packageList.status == 0){
+            hasPackage = packageList.result.any{element -> element.SubscriberPackageVersionId.startsWith(packageVersionId)}
+        }
+    }catch(Exception ex){}
+
+    return hasPackage;
+}
+
+/*
+ *  Method to create package version for the given package name
+ */
+def createPackageVersionFor(def packageName, def path, def isRelease){
+    def rmsg = sh returnStdout: true, script: "sfdx force:package:version:create -p '${packageName}' -d ${path} -x -w 200 -v ${DEFAULT_DEVHUB_USER} -f config/project-scratch-def.json -c --json"
+    def props = readJSON text: rmsg
+    if(props.status == 0){
+        if(!props.containsKey('result')){
+            echo "No results found. Check the package version creation status manually"
+        }else if(props.result.Status == "${STATUS_QUEUED}"){
+            echo "Package version creation request status is 'Queued'. Run 'sfdx force:package:version:create:report -i ${props.result.Id}' to query for status."
+        }else if(props.result.Status == "${STATUS_SUCCESS}"){
+            echo "Successfully created the package version [${props.result.Id}]. Subscriber Package Version Id: ${props.result.SubscriberPackageVersionId}"
+            
+            echo "${packageName} Package Installation URL: https://login.salesforce.com/packaging/installPackage.apexp?p0=${props.result.SubscriberPackageVersionId}"
+            
+            if(isRelease){
+                sh "sfdx force:package:version:promote -p ${props.result.SubscriberPackageVersionId} -n -v ${DEFAULT_DEVHUB_USER}"
+            }
+        }
+    }else{
+        currentBuild.result = "FAILED"
+        echo "Package version creation request failed."
+        echo "${props.stack}"
+    }
+}

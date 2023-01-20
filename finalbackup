@@ -6,6 +6,8 @@ this is third changes
 this is fourth
 this is fifth
 this is sixth
+this is seventh
+this is eight
 
 def createScratchOrg(ORG_ALIAS) {
     stage('Create Scratch Org'){

@@ -1,14 +1,6 @@
 node(){
     stage('test'){
-    def output = sh(script: "$JENKINS_HOME/org-credentials/used-scratch-org.sh ${env.JOB_NAME}", returnStdout: true).split('\n')
-    def ada = "${output[0]}"
-    if (ada == 'notFound'){
-        echo "Feature Org Not Available : Allocating From Global Storage"       
-        def output2 = sh(script: "$JENKINS_HOME/org-credentials/select-scratch-org.sh ${env.JOB_NAME}", returnStdout: true).split('\n')
-        echo "${output2[0]} ${output2[1]} ${output2[2]}"
-    }else{
-        echo "Feature Org Already Allocated For This Job - From Global Storage"
-        echo "${output[0]} ${output[1]} ${output[2]}"
-    }
+    echo "${BRANCH_NAME[0]}"
+
     }
 }

@@ -1,5 +1,5 @@
 node(){
-stage('test 1){
+stage('test 1'){
 echo "this is adarsha"
 }
 }

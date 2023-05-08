@@ -1,0 +1,5 @@
+node(){
+  stage('test'){
+     sh "sed -i 's/cqext__Hazard__c/Hazard__c/g' compliancequest__SQX_Defect_Code__c-compliancequest__Defect Code Layout.layout" 
+  }
+}
